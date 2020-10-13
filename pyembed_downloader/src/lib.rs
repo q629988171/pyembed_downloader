@@ -1,153 +1,136 @@
-extern crate bytes;
-extern crate clap;
-extern crate md5;
-extern crate regex;
-extern crate reqwest;
+#[macro_use]
+extern crate log;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+mod config;
+mod utility;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let matches = clap::App::new("pyembed_downloader")
-        .version("0.0.2")
-        .arg(
-            clap::Arg::with_name("32")
-                .long("32")
-                .help("下载 32 位版本，默认下载 64 位版本"),
-        )
-        .arg(
-            clap::Arg::with_name("skip-download")
-                .long("skip-download")
-                .help("跳过下载，直接使用已有的文件"),
-        )
-        .arg(
-            clap::Arg::with_name("dir")
-                .long("dir")
-                .takes_value(true)
-                .help("工作目录，默认为当前目录"),
-        )
-        .arg(
-            clap::Arg::with_name("pip-mirror")
-                .long("pip-mirror")
-                .takes_value(true)
-                .value_name("url")
-                .help("通过指定 pip 镜像站下载依赖包"),
-        )
-        .arg(
-            clap::Arg::with_name("keep-scripts")
-                .long("keep-scripts")
-                .help("保留 Scripts 目录"),
-        )
-        .arg(
-            clap::Arg::with_name("keep-dist-info")
-                .long("keep-dist-info")
-                .help("保留 dist-info 目录，删除此目录后将无法再通过 pip 管理依赖"),
-        )
-        .arg(
-            clap::Arg::with_name("keep-pip")
-                .long("keep-pip")
-                .help("保留 pip、setuptools、wheel 依赖包"),
-        )
-        .arg(
-            clap::Arg::with_name("PACKAGES")
-                .index(1)
-                .multiple(true)
-                .help("要安装的 pip 依赖包"),
-        )
-        .get_matches();
+pub use config::Config;
 
-    let currentdir = std::env::current_dir()?;
-    let mut workdir =
-        std::path::PathBuf::from(matches.value_of_os("dir").unwrap_or(currentdir.as_os_str()));
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// cli 和 gui 共用的核心执行逻辑
+// 此处不再检查 config，要确保传入正确的值
+// 进度回调为 (total, read)
+// 如果进度回调都为 -1，则表示重置进度，对于 cli，重置光标到行首，对于 gui，把滚动条设置为不确定值状态
+pub async fn run(config: &config::Config, progress_callback: &dyn Fn(i64, i64)) -> Result<()> {
+    utility::setup_job()?;
+
+    let mut workdir = config.dir.clone();
     if workdir.is_relative() {
-        workdir = currentdir.join(workdir);
+        workdir = std::env::current_dir()?.join(workdir);
     }
-    let targetdir = workdir.join("target");
-    let is32 = matches.is_present("32");
-    let skipdownload = matches.is_present("skip-download");
-    let pipmirror = matches.value_of("pip-mirror");
-    let keepscripts = matches.is_present("keep-scripts");
-    let keepdistinfo = matches.is_present("keep-dist-info");
-    let keeppip = matches.is_present("keep-pip");
-    let packages: Vec<&str> = matches.values_of("PACKAGES").unwrap_or_default().collect();
-
-    unsafe {
-        setup_job()?;
-    }
-
     std::fs::create_dir_all(&workdir)?;
 
-    if skipdownload {
+    let targetdir = workdir.join("pyembed_runtime");
+
+    if config.skip_download {
+        warn!("正在检查本地 Python 版本 ...");
         let v = get_local_python_version(&targetdir)?;
-        println!("本地版本：\t{}.{}.{}", v.0, v.1, v.2);
+        info!("本地版本：{}.{}.{}", v.0, v.1, v.2);
     } else {
         if !is_empty_dir(&targetdir)? {
             return Err(format!("{} 目录非空", targetdir.display()).into());
         }
 
-        let v = get_latest_python_version().await?;
-        println!("最新版本：\t{}", v);
-
-        let info = get_python_download_info(&v, is32).await?;
-        println!("下载链接：\t{}", info.0);
-        println!("文件哈希：\t{}", info.1);
-
-        println!("正在下载 ...");
-        let pyembeddata = download(&info.0).await?;
-        //let pyembeddata = std::fs::read(r"D:\下载\python-3.8.5-embed-amd64.zip")?;
-
-        println!("校验文件完整性 ...");
-        let hash = format!("{:x}", md5::compute(&pyembeddata));
-        if !hash.eq_ignore_ascii_case(&info.1) {
-            println!("文件哈希不匹配");
-            println!("预期：\t{}", info.1);
-            println!("实际：\t{}", hash);
-            return Err("文件哈希不匹配".into());
+        let v;
+        if config.pyver == "latest" || config.pyver.is_empty() {
+            warn!("正在获取最新版本号 ...");
+            v = get_latest_python_version().await?;
+            info!("最新版本：{}", v);
+        } else {
+            v = config.pyver.clone();
+            if utility::regex_find(r"^\d+\.\d+\.\d+$", &v).is_none() {
+                return Err("版本号格式错误".into());
+            }
+            info!("指定版本：{}", v);
         }
 
+        warn!("正在获取下载信息 ...");
+        let info = get_python_download_info(&v, config.is32).await?;
+        info!("下载链接：{}", info.0);
+        info!("文件哈希：{}", info.1);
+
         let mut arch = "amd64";
-        if is32 {
+        if config.is32 {
             arch = "x86";
         }
         let filename = format!("python-{}-embed-{}.zip", v, arch);
         let mainpath = workdir.join(filename);
-        std::fs::write(&mainpath, &pyembeddata)?;
 
-        println!("解压文件 ...");
+        let mut mainfileexists = false;
+        if mainpath.exists() {
+            if let Ok(pyembeddata) = std::fs::read(&mainpath) {
+                let hash = format!("{:x}", md5::compute(&pyembeddata));
+                if hash.eq_ignore_ascii_case(&info.1) {
+                    info!("文件已存在，跳过下载");
+                    mainfileexists = true;
+                }
+            }
+        }
+
+        if !mainfileexists {
+            warn!("正在下载 ...");
+            let pyembeddata = download_progress(&info.0, progress_callback).await?;
+            //let pyembeddata = std::fs::read(r"D:\下载\python-3.8.5-embed-amd64.zip")?;
+            progress_callback(-1, -1);
+            warn!("校验文件完整性 ...");
+            let hash = format!("{:x}", md5::compute(&pyembeddata));
+            if !hash.eq_ignore_ascii_case(&info.1) {
+                info!("文件哈希不匹配");
+                info!("预期：{}", info.1);
+                info!("实际：{}", hash);
+                return Err("文件哈希不匹配".into());
+            }
+
+            std::fs::write(&mainpath, &pyembeddata)?;
+        }
+
+        warn!("解压文件 ...");
         extract(&mainpath, &targetdir)?;
     }
 
     let pippath = workdir.join("get-pip.py");
-    if !skipdownload || !pippath.exists() {
-        println!("正在下载 pip ...");
-        let pipdata = download("https://bootstrap.pypa.io/get-pip.py").await?;
+    if !config.skip_download || !pippath.exists() {
+        warn!("正在下载 pip ...");
+        let pipdata =
+            download_progress("https://bootstrap.pypa.io/get-pip.py", progress_callback).await?;
+        progress_callback(-1, -1);
         //let pipdata = std::fs::read(r"D:\下载\get-pip.py")?;
         std::fs::write(&pippath, &pipdata)?;
     }
 
-    println!("修改 Python Path ...");
+    warn!("修改 Python Path ...");
     ensure_pth(&targetdir)?;
 
-    println!("安装 pip ...");
-    setup_pip(&targetdir, &pippath, pipmirror)?;
-    pip_install(&targetdir, &["pip"], pipmirror)?;
-    pip_install(&targetdir, &["setuptools", "wheel"], pipmirror)?;
+    warn!("安装 pip ...");
+    setup_pip(&targetdir, &pippath, Some(&config.pip_mirror))?;
+    pip_install(&targetdir, &["pip"], Some(&config.pip_mirror))?;
+    pip_install(
+        &targetdir,
+        &["setuptools", "wheel"],
+        Some(&config.pip_mirror),
+    )?;
 
-    if packages.len() > 0 {
-        println!("安装依赖包 ...");
-        pip_install(&targetdir, &packages, pipmirror)?;
+    if config.packages.len() > 0 {
+        warn!("安装依赖包 ...");
+        pip_install(&targetdir, &config.packages, Some(&config.pip_mirror))?;
     }
 
-    println!("编译 ...");
+    warn!("正在编译 ...");
     compile(&targetdir)?;
 
-    println!("安装结果");
+    info!("安装结果");
     pip_list(&targetdir)?;
 
-    println!("清理 ...");
-    cleanup(&targetdir, keeppip, keepscripts, keepdistinfo)?;
+    warn!("正在清理 ...");
+    cleanup(
+        &targetdir,
+        config.keep_pip,
+        config.keep_scripts,
+        config.keep_dist_info,
+    )?;
 
-    println!("完成！");
+    warn!("完成！");
     Ok(())
 }
 
@@ -167,16 +150,16 @@ fn compile(dir: &std::path::Path) -> Result<()> {
 }
 
 fn _py_compile(dir: &std::path::Path) -> Result<()> {
-    let script = format!(
-        r#"
+    let script = r#"
 # encoding: utf-8
 
-ROOT = r"{}"
-FOUND_PYD = False
-
+import sys
 import os
 import py_compile
 import shutil
+
+ROOT = sys.argv[1]
+FOUND_PYD = False
 
 def compile(dir):
     sitedir = os.path.join(ROOT, "Lib", "site-packages")
@@ -185,38 +168,37 @@ def compile(dir):
         shortname = os.path.join(dir, i)
         if os.path.isdir(fullname):
             if i.lower() == "__pycache__":
-                print(f"删除：{{shortname}}")
+                print(f"删除：{shortname}")
                 shutil.rmtree(fullname)
             elif i.lower().endswith(".dist-info"):
-                print(f"跳过：{{shortname}}")
+                print(f"跳过：{shortname}")
             else:
                 compile(shortname)
         elif os.path.isfile(fullname):
             if i.lower().endswith(".py"):
-                print(f"编译：{{shortname}}")
+                print(f"编译：{shortname}")
                 try:
                     py_compile.compile(fullname, fullname + "c", doraise=True)
                 except:
-                    print(f"编译失败，跳过：{{shortname}}")
+                    print(f"编译失败，跳过：{shortname}")
                 else:
                     os.remove(fullname)
             elif i.lower().endswith(".pyd"):
                 global FOUND_PYD
                 FOUND_PYD = True
         else:
-            print(f"未知文件类型：{{shortname}}")
+            print(f"未知文件类型：{shortname}")
 
 compile(".")
 if not FOUND_PYD:
     print("==========")
     print("没有发现 .pyd 文件，site-packages 目录也许可以被打包为 zip")
-"#,
-        dir.to_str().unwrap()
-    );
+"#;
 
     use std::io::Write;
     let mut cmd = new_python_command(dir);
     cmd.arg("-");
+    cmd.arg(dir);
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.stdin(std::process::Stdio::piped());
     let mut process = cmd.spawn()?;
@@ -225,7 +207,10 @@ if not FOUND_PYD:
         .as_mut()
         .unwrap()
         .write_all(script.as_bytes())?;
+    let (t1, t2) = process_output_to_log(&mut process);
     let status = process.wait()?;
+    t1.join().unwrap();
+    t2.join().unwrap();
     if !status.success() {
         return Err(format!("编译失败 [{}]", status).into());
     }
@@ -259,7 +244,7 @@ fn cleanup(
         }
     }
     for i in rmdirs {
-        println!("删除目录：{}", i.display());
+        info!("删除目录：{}", i.display());
         std::fs::remove_dir_all(i)?;
     }
     Ok(())
@@ -270,9 +255,15 @@ fn setup_pip(dir: &std::path::Path, pip: &std::path::Path, mirror: Option<&str>)
     cmd.arg(pip);
     cmd.args(&["--no-cache-dir", "--no-warn-script-location"]);
     if let Some(mirror) = mirror {
-        cmd.args(&["-i", mirror]);
+        if !mirror.is_empty() {
+            cmd.args(&["-i", mirror]);
+        }
     }
-    let status = cmd.spawn()?.wait()?;
+    let mut process = cmd.spawn()?;
+    let (t1, t2) = process_output_to_log(&mut process);
+    let status = process.wait()?;
+    t1.join().unwrap();
+    t2.join().unwrap();
     if !status.success() {
         return Err(format!("安装 pip 失败 [{}]", status).into());
     }
@@ -326,9 +317,40 @@ fn get_local_python_version(dir: &std::path::Path) -> Result<(u8, u8, u8)> {
 }
 
 fn new_python_command(dir: &std::path::Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new(dir.join("python.exe"));
     cmd.current_dir(dir);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
     cmd
+}
+
+fn read_to_log(
+    read: impl std::io::Read + Send + 'static,
+    level: log::Level,
+) -> std::thread::JoinHandle<()> {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(read);
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap();
+            if n == 0 {
+                break;
+            }
+            log!(level, "{}", line.trim());
+        }
+    })
+}
+
+fn process_output_to_log(process: &mut std::process::Child) -> (std::thread::JoinHandle<()>,std::thread::JoinHandle<()>) {
+    let stdout = process.stdout.take().unwrap();
+    let stderr = process.stderr.take().unwrap();
+    let t1 = read_to_log(stdout, log::Level::Info);
+    let t2 = read_to_log(stderr, log::Level::Error);
+    (t1, t2)
 }
 
 fn pip_install<I, S>(dir: &std::path::Path, pkgnames: I, mirror: Option<&str>) -> Result<()>
@@ -346,12 +368,18 @@ where
         "-U",
     ]);
     if let Some(mirror) = mirror {
-        cmd.args(&["-i", mirror]);
+        if !mirror.is_empty() {
+            cmd.args(&["-i", mirror]);
+        }
     }
     for i in pkgnames {
         cmd.arg(i);
     }
-    let status = cmd.spawn()?.wait()?;
+    let mut process = cmd.spawn()?;
+    let (t1, t2) = process_output_to_log(&mut process);
+    let status = process.wait()?;
+    t1.join().unwrap();
+    t2.join().unwrap();
     if !status.success() {
         return Err(format!("安装依赖包失败 [{}]", status).into());
     }
@@ -368,7 +396,11 @@ where
     for i in pkgnames {
         cmd.arg(i);
     }
-    let status = cmd.spawn()?.wait()?;
+    let mut process = cmd.spawn()?;
+    let (t1, t2) = process_output_to_log(&mut process);
+    let status = process.wait()?;
+    t1.join().unwrap();
+    t2.join().unwrap();
     if !status.success() {
         return Err(format!("卸载依赖包失败 [{}]", status).into());
     }
@@ -378,9 +410,21 @@ where
 fn pip_list(dir: &std::path::Path) -> Result<()> {
     let mut cmd = new_python_command(dir);
     cmd.args(&["-m", "pip", "list"]);
-    let status = cmd.spawn()?.wait()?;
-    if !status.success() {
-        return Err(format!("pip list 失败 [{}]", status).into());
+    cmd.args(&["--format", "columns"]);
+    let output = cmd.output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    if !output.status.success() {
+        info!("{}", stdout);
+        return Err(format!("pip list 失败 [{}]", output.status).into());
+    } else {
+        // 从结果中过滤掉 pip、setuptools、wheel
+        for i in stdout.lines().filter(|line| {
+            !line.starts_with("pip ")
+                && !line.starts_with("setuptools ")
+                && !line.starts_with("wheel ")
+        }) {
+            info!("{}", i);
+        }
     }
     Ok(())
 }
@@ -404,27 +448,13 @@ fn extract(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn download(url: impl reqwest::IntoUrl) -> reqwest::Result<bytes::Bytes> {
-    Ok(reqwest::get(url).await?.bytes().await?)
-}
-
 async fn get(url: impl reqwest::IntoUrl) -> reqwest::Result<String> {
     Ok(reqwest::get(url).await?.text().await?)
 }
 
-fn regex_find<'a>(re: &str, text: &'a str) -> Option<regex::Captures<'a>> {
-    if let Ok(re) = regex::RegexBuilder::new(re)
-        .dot_matches_new_line(true)
-        .build()
-    {
-        return re.captures(text);
-    }
-    None
-}
-
 async fn get_latest_python_version() -> Result<String> {
     let body = get("https://www.python.org/downloads/windows/").await?;
-    if let Some(caps) = regex_find(r"Latest Python 3 Release - Python ([\d\.]+)", &body) {
+    if let Some(caps) = utility::regex_find(r"Latest Python 3 Release - Python ([\d\.]+)", &body) {
         if let Some(ver) = caps.get(1) {
             return Ok(ver.as_str().into());
         }
@@ -442,7 +472,7 @@ async fn get_python_download_info(ver: &str, is32: bool) -> Result<(String, Stri
     if is32 {
         re = r#""([^"]*?)">Windows x86 embeddable zip file.*?([a-fA-F0-9]{32})"#;
     }
-    if let Some(caps) = regex_find(re, &body) {
+    if let Some(caps) = utility::regex_find(re, &body) {
         if caps.len() == 3 {
             return Ok((
                 caps.get(1).unwrap().as_str().into(),
@@ -453,34 +483,29 @@ async fn get_python_download_info(ver: &str, is32: bool) -> Result<(String, Stri
     Err("找不到信息".into())
 }
 
-// https://github.com/rust-lang/cargo/blob/master/src/cargo/util/job.rs
-// 简单一抄，凑合能用
-unsafe fn setup_job() -> Result<()> {
-    use winapi::shared::minwindef::*;
-    use winapi::um::jobapi2::*;
-    use winapi::um::processthreadsapi::*;
-    use winapi::um::winnt::*;
+async fn download_progress(
+    url: impl reqwest::IntoUrl,
+    callback: &dyn Fn(i64, i64),
+) -> Result<bytes::Bytes> {
+    use bytes::BufMut;
+    use tokio::stream::StreamExt;
 
-    let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-    if job.is_null() {
-        return Err("CreateJobObject failed".into());
+    let res = reqwest::get(url).await?;
+    if !res.status().is_success() {
+        let code: u16 = res.status().into();
+        return Err(format!("http request failed with status code {}", code).into());
     }
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-    info = std::mem::zeroed();
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let r = SetInformationJobObject(
-        job,
-        JobObjectExtendedLimitInformation,
-        &mut info as *mut _ as LPVOID,
-        std::mem::size_of_val(&info) as DWORD,
-    );
-    if r == 0 {
-        return Err("SetInformationJobObject failed".into());
+    let mut data = bytes::BytesMut::new();
+    let mut total_size: i64 = -1;
+    if let Some(len) = res.headers().get(reqwest::header::CONTENT_LENGTH) {
+        total_size = len.to_str()?.parse::<i64>()?;
     }
-    let me = GetCurrentProcess();
-    let r = AssignProcessToJobObject(job, me);
-    if r == 0 {
-        return Err("AssignProcessToJobObject failed".into());
+    callback(total_size, 0);
+    let mut stream = res.bytes_stream();
+    while let Some(item) = stream.next().await {
+        let item = item?;
+        data.put(item);
+        callback(total_size, data.len() as _);
     }
-    Ok(())
+    Ok(data.into())
 }
